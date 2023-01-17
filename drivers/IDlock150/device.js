@@ -1,20 +1,18 @@
 'use strict';
 
-const ZwaveDevice = require('homey-meshdriver').ZwaveDevice;
-const Homey = require('homey');
+const { ZwaveDevice } = require('homey-zwavedriver');
 
 // Documentation: https://Products.Z-WaveAlliance.org/ProductManual/File?folder=&filename=Manuals/2293/IDL Operational Manual EN v1.3.pdf
 
 class IDlock150 extends ZwaveDevice {
-	onMeshInit() {
-		let unlockTrigger = new Homey.FlowCardTriggerDevice('lockstate');
-		unlockTrigger.register();
+
+	async onMeshInit() {
 
 		// enable debugging
-		this.enableDebug();
+		// this.enableDebug();
 
 		// print the node's info to the console
-		this.printNode();
+		// this.printNode();
 
 		this.registerCapability('locked', 'DOOR_LOCK', {
 			getOpts: {
@@ -26,8 +24,12 @@ class IDlock150 extends ZwaveDevice {
 				if (report && report.hasOwnProperty('Door Lock Mode')) {
 					// reset alarm_tamper or alarm_heat based on Unlock report
 					if (report['Door Lock Mode'] === 'Door Unsecured') {
-						if (this.getCapabilityValue('alarm_tamper')) this.setCapabilityValue('alarm_tamper', false);
-						if (this.getCapabilityValue('alarm_heat')) this.setCapabilityValue('alarm_heat', false);
+						if (this.getCapabilityValue('alarm_tamper')) {
+							this.setCapabilityValue('alarm_tamper', false).catch(err => this.error('DOOR LOCK: Setting \'alarm_tamper\' capability value failed:', err))
+						}
+						if (this.getCapabilityValue('alarm_heat')) {
+							this.setCapabilityValue('alarm_heat', false).catch(err => this.error('DOOR LOCK: Setting \'alarm_heat\' capability value failed:', err))
+						}
 						this.log('DOOR_LOCK: reset tamper and heat alarm');
 					};
 					return report['Door Lock Mode'] === 'Door Secured';
@@ -44,60 +46,104 @@ class IDlock150 extends ZwaveDevice {
 			reportParser: report => {
 				this.log("  ---- Notification ----");
 				if (report && report['Notification Type'] === 'Access Control' && report.hasOwnProperty('Event')) {
-					var triggerSettings = Homey.ManagerSettings.get('triggerSettings') || { "homey": false, "code": false, "tag": false, "button": false };
-					var codes = JSON.parse(Homey.ManagerSettings.get('codes'));
-					//Keypad Unlock Operation
-					if (report['Event'] === 6 && report.hasOwnProperty('Event Parameter')) {
-						var keyType = parseInt(report['Event Parameter'][0]);
-						if (keyType === 0){
-							if (triggerSettings.homey){
-								unlockTrigger.trigger(this, {"who":"Homey"}, null).catch( this.error ).then( this.log('Homey opened the door') );
+
+					this.homey.settings
+					let triggerSettings = this.homey.settings.get('triggerSettings') || { "homey": false, "code": false, "tag": false, "button": false, "auto": false };
+					let token = { "who": "Uknown", "type": "None" };
+					let state = { "who": "Uknown", "type": "none" };
+
+					// Lock jammed
+					if (report['Event'] === 11) {
+						this.homey.flow.getTriggerCard('lock_jammed').trigger(null, null).catch(this.error);
+						this.log('Trigger lock jammed');
+					}
+
+					// Button/manual lock/unlock Operation
+					else if (report['Event'] === 1 || report['Event'] === 2) {
+						token = { "who": "Button", "type": "Manual" };
+						state = { "who": "Button", "type": "manual" };
+						if (report['Event'] === 1) {
+							this.triggerDoorLock(token, state, triggerSettings.button);
+						}
+						else {
+							this.triggerDoorUnlock(token, state, triggerSettings.button);
+						}
+					}
+
+					// Auto lock locked Operation
+					else if (report['Event'] === 9) {
+						token = { "who": "Automatic", "type": "Automatic" };
+						state = { "who": "Automatic", "type": "automatic" };
+						this.triggerDoorLock(token, state, triggerSettings.auto);
+					}
+
+					// Other operations, index based
+					else if (report.hasOwnProperty('Event Parameter')) {
+						let triggerSetting;
+						let keyType = parseInt(report['Event Parameter'][0]);
+						let codes = JSON.parse(this.homey.settings.get('codes'));
+						let indexMode = this.getSetting('Index_Mode');
+						let masterIndex = 1;
+						let serviceIndex = 2
+						let keyOffset = -59;
+						let tagOffset = -9;
+						// Override vith new indexing from v1.6
+						if (indexMode === '2') {
+							masterIndex = 109;
+							serviceIndex = 108
+							keyOffset = 0;
+							tagOffset = -25;
+						}
+						// Keypad Unlock Operation
+						if (report['Event'] === 5 || report['Event'] === 6) {
+							triggerSetting = triggerSettings.code;
+							if (keyType === masterIndex) {
+								token = { "who": "Master", "type": "Code" };
+								state = { "who": "Master", "type": "code" };
+							} else if (keyType === serviceIndex) {
+								token = { "who": "Service", "type": "Code" };
+								state = { "who": "Service", "type": "code" };
 							}
-						} else if (keyType === 1){
-							if (triggerSettings.code){
-								unlockTrigger.trigger(this, {"who":"Master"},null).catch( this.error ).then( this.log('Master opened the door') );
-							}
-						} else if (keyType === 2){
-							if (triggerSettings.code){
-								unlockTrigger.trigger(this, {"who":"Service"},null).catch( this.error ).then( this.log('Service opened the door') );
-							}
-						} else {
-							//let codes = JSON.parse(Homey.ManagerSettings.get('codes'));
-							let keyId = keyType-59;
-							let type = parseInt(report['Event (Raw)'][0]);
-							let user = 'Unknown [key:'+keyId+']';
-							this.log("Codes", codes);
-							for(var i in codes){
-								if (codes[i].index === keyId && codes[i].type=== type){
-									user = codes[i].user;
+							else {
+								let keyId = keyType + keyOffset;
+								let type = parseInt(report['Event (Raw)'][0]);
+								let user = 'Unknown [key:' + keyId + ']';
+								for (var i in codes) {
+									if (codes[i].index === keyId && codes[i].type === type) {
+										user = codes[i].user;
+									}
 								}
-							}
-							if (triggerSettings.code){
-								unlockTrigger.trigger(this, {"who":user},null).catch( this.error ).then( this.log(user, ' opened the door') )
-							}
-						}
-					}
-					//RF Unlock Operation
-					if (report['Event'] === 4 && report.hasOwnProperty('Event Parameter')) {
-						//let codes = JSON.parse(Homey.ManagerSettings.get('codes'));
-						let tagId = parseInt(report['Event Parameter'][0])-9;
-						let type = parseInt(report['Event (Raw)'][0]);
-						let user = 'Unknown [tag:'+tagId+']';
-						this.log("Codes", codes);
-						for(var i in codes){
-							if (codes[i].index === tagId && codes[i].type=== type){
-								user = codes[i].user;
+								token = { "who": user, "type": "Code" };
+								state = { "who": user, "type": "code" };	
 							}
 						}
-						if (triggerSettings.tag){
-							unlockTrigger.trigger(this, {"who":user},null).catch( this.error ).then( this.log(user, ' opened the door') );
+						// RF Lock/Unlock Operation
+						else if (report['Event'] === 3 || report['Event'] === 4) {
+							if (keyType === 0) {
+								triggerSetting = triggerSettings.homey;
+								token = { "who": "Homey", "type": "Automatic" };
+								state = { "who": "Homey", "type": "automatic" };
+							}
+							else {
+								let tagId = keyType + tagOffset;
+								let type = parseInt(report['Event (Raw)'][0]);
+								let user = 'Unknown [tag:' + tagId + ']';
+								for (var i in codes) {
+									if (codes[i].index === tagId && codes[i].type === type) {
+										user = codes[i].user;
+									}
+								}
+								triggerSetting = triggerSettings.tag;
+								token = { "who": user, "type": "Tag" };
+								state = { "who": user, "type": "tag" };							
+							}
 						}
-					}
-					//Manual Unlock Operation
-					if (report['Event'] === 2) {
-						if (triggerSettings.button){
-							unlockTrigger.trigger(this, {"who":"Button"}, null).catch( this.error ).then( this.log('Button opened the door') );
+						if (report['Event'] === 3 || report['Event'] === 5) {
+							this.triggerDoorLock(token, state, triggerSetting);
 						}
+						else {
+							this.triggerDoorUnlock(token, state, triggerSetting);
+						}						
 					}
 				}
 				return null;
@@ -108,6 +154,7 @@ class IDlock150 extends ZwaveDevice {
 			get: 'DOOR_LOCK_OPERATION_GET',
 			getOpts: {
 				getOnStart: true,
+				getOnOnline: false,
 			},
 			report: 'DOOR_LOCK_OPERATION_REPORT',
 			reportParserV2(report) {
@@ -120,91 +167,88 @@ class IDlock150 extends ZwaveDevice {
 			},
 		});
 
-		// register BATTERY capabilities
 		this.registerCapability('measure_battery', 'BATTERY', {
 			getOpts: {
-				getOnStart: true,
+				getOnStart: false,
 				getOnOnline: false,
 			}
 		});
 
-		this.registerCapability('alarm_battery', 'BATTERY');
+		this.registerCapability('alarm_battery', 'BATTERY', {
+			getOpts: {
+				getOnStart: false,
+				getOnOnline: false,
+			}
+		});
 
-		// register alarm capabilities for devices with COMMAND_CLASS_NOTIFICATION
-		const commandClassNotification = this.getCommandClass('NOTIFICATION');
-		if (!(commandClassNotification instanceof Error)) {
-			this.registerCapability('alarm_tamper', 'NOTIFICATION', {
-				getOpts: {
-					getOnStart: true,
-					getOnOnline: false,
-				}
-			});
+		this.registerCapability('alarm_tamper', 'NOTIFICATION', {
+			getOpts: {
+				getOnStart: false,
+				getOnOnline: false,
+			}
+		});
 
-			this.registerCapability('alarm_heat', 'NOTIFICATION', {
-				get: 'NOTIFICATION_GET',
-				getOpts: {
-					getOnStart: true,
-					getOnOnline: false,
-				},
-				getParser: () => ({
-					'V1 Alarm Type': 0,
-					'Notification Type': 'Emergency',
-					Event: 2,
-				}),
-				report: 'NOTIFICATION_REPORT',
-				reportParser: report => {
-					if (report && report['Notification Type'] === 'Emergency' && report.hasOwnProperty('Event (Parsed)')) {
-						if (report['Event (Parsed)'] === 'Contact Fire Service') return true;
-						if (report['Event (Parsed)'] === 'Event inactive' &&
-							report.hasOwnProperty('Event Parameter') &&
-							(report['Event Parameter'][0] === 2 ||
-								report['Event Parameter'][0] === 254)) {
-							return false;
-						}
+		this.registerCapability('alarm_heat', 'NOTIFICATION', {
+			get: 'NOTIFICATION_GET',
+			getOpts: {
+				getOnStart: false,
+				getOnOnline: false,
+			},
+			getParser: () => ({
+				'V1 Alarm Type': 0,
+				'Notification Type': 'Emergency',
+				Event: 2,
+			}),
+			report: 'NOTIFICATION_REPORT',
+			reportParser: report => {
+				if (report && report['Notification Type'] === 'Emergency' && report.hasOwnProperty('Event (Parsed)')) {
+					if (report['Event (Parsed)'] === 'Contact Fire Service') return true;
+					if (report['Event (Parsed)'] === 'Event inactive' &&
+						report.hasOwnProperty('Event Parameter') &&
+						(report['Event Parameter'][0] === 2 ||
+							report['Event Parameter'][0] === 254)) {
+						return false;
 					}
-					return null;
 				}
-			});
-			this.log('registered COMMAND_CLASS_NOTIFICATION capabilities listeners');
-		}
-		// register alarm capabilities for devices with COMMAND_CLASS_ALARM
-		if (!(this.getCommandClass('ALARM') instanceof Error)) {
-			this.registerCapability('alarm_tamper', 'ALARM', {
-				get: 'ALARM_GET',
-				getOpts: {
-					getOnStart: true,
-				},
-				getParser: () => ({
-					'Alarm Type': 10,
-				}),
-				report: 'ALARM_REPORT',
-				reportParser: report => {
-					if (report && report['Alarm Type'] === 10 && report.hasOwnProperty('Alarm Level')) {
-						return report['Alarm Level'] === 1
-					}
-					return null;
-				}
-			});
-
-			this.registerCapability('alarm_heat', 'ALARM', {
-				get: 'ALARM_GET',
-				getOpts: {
-					getOnStart: true,
-				},
-				getParser: () => ({
-					'Alarm Type': 4,
-				}),
-				report: 'ALARM_REPORT',
-				reportParser: report => {
-					if (report && report['Alarm Type'] === 4 && report.hasOwnProperty('Alarm Level')) {
-						return report['Alarm Level'] === 1
-					}
-					return null;
-				}
-			});
-
-			this.log('registered COMMAND_CLASS_ALARM capabilities listeners');
-		}
+				return null;
+			}
+		});
 	}
+
+	triggerDoorLock(token, state, triggerSetting) {
+		// this.setCapabilityValue('locked', true) // not sure if needed - but the lock icon has wrong if not added
+		this.homey.flow.getTriggerCard('door_lock').trigger(token, state).catch(this.error);
+		if (triggerSetting) {
+			this.homey.flow.getTriggerCard('unlockstate').trigger(token, state).catch(this.error);
+		}
+		this.log('---- Trigger door lock ---- ')
+		this.log(token);
+		this.log(state);
+	}
+
+	triggerDoorUnlock(token, state, triggerSetting) {
+		// this.setCapabilityValue('locked', false)  // not sure if needed - but the lock icon has wrong if not added
+		this.homey.flow.getTriggerCard('door_unlock').trigger(token, state).catch(this.error);
+		if (triggerSetting) {
+			this.homey.flow.getTriggerCard('lockstate').trigger(token, state).catch(this.error);
+		}
+		this.log('---- Trigger door unlock ---- ')
+		this.log(token);
+		this.log(state);
+	}
+
+	async awaymodeActionRunListener(args, state) {
+		console.log('---- Set away mode ---- ');
+		return this.configurationSet({
+			index: 1, // Doorlock_mode
+			size: 1,
+		}, args.mode)
+			.then(result => {
+				// Also update app setting to same value
+				this.setSettings({ Doorlock_mode: args.mode })
+				return result;
+			})
+	}
+
 }
 module.exports = IDlock150;
